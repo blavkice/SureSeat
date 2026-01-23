@@ -139,5 +139,4 @@ MIT License - feel free to use and modify
 
 ## Disclaimer
 
-This tool is for personal use only. Please respect Affluences' terms of service and booking policies. Use responsibly and don't abuse the automation features.bash
-pip install selenium webdriver-manager streamlit requests
+This tool is for personal use only. Please respect Affluences' terms of service and booking policies. Use responsibly and don't abuse the automation features.
