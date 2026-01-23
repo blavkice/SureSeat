@@ -1,15 +1,19 @@
 # SureSeat
 
-Automated booking system for Affluences (libraries, study rooms, etc.). Handles reservations and email confirmations automatically because doing it manually gets old fast.
+Automated reservation system targeting the Affluences booking platform. After deconstructing the API endpoints and reverse-engineering the booking flow, I built this tool to bypass the manual UI workflow entirely as it was so boring to use
 
-## Features
+**Technical Approach**: Intercepted and analyzed the booking POST requests to identify required parameters and authentication patterns. Implemented direct API interaction bypassing the web interface, combined with IMAP-based email scraping for confirmation token extraction.
 
-- Automated booking for multiple dates and time slots
-- Auto-validation from confirmation emails
-- Multi-slot support (book morning + afternoon in one go)
-- Save multiple locations
-- Repeat bookings across a week
-- Parallel validation with multiple browser instances
+**Security Implementation**: Machine-specific credential encryption using XOR cipher with SHA256-derived keys tied to hostname+username. All sensitive data encrypted at rest, no plaintext credentials in version control.
+
+## Capabilities
+
+- Direct API booking via reverse-engineered endpoints
+- Automated email confirmation harvesting (IMAP search with Italian date parsing)
+- Concurrent validation using headless Chrome instances (ThreadPoolExecutor)
+- Hardware-tied credential encryption (machine-specific decryption keys)
+- Persistent state management with JSON storage
+- Built-in rate limiting and daemon conflict resolution
 
 ## Installation
 
@@ -23,7 +27,7 @@ Automated booking system for Affluences (libraries, study rooms, etc.). Handles 
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/sureseat.git
+git clone https://github.com/blavkice/SureSeat.git
 cd sureseat
 ```
 
@@ -48,7 +52,7 @@ Email credentials are saved securely in `.streamlit/.creds` with encryption base
 3. In SureSeat sidebar, enter your Gmail and App Password
 4. Click "Save"
 
-**Note:** Credentials are encrypted and automatically loaded on app start. They are tied to your machine for security.
+**Note:** Credentials are encrypted and automatically loaded on app start. They are tied to your machine.
 
 ### Adding Places (Resources)
 
@@ -119,7 +123,7 @@ If you encounter Chrome daemon conflicts:
 
 ## Notes
 
-- **Language**: Currently only works with Italian emails (searches for "gennaio", "febbraio", etc.)
+- **Language**: Currently only works with Italian emails (date parsing looks for "gennaio", "febbraio", etc.)
 - **Rate Limiting**: The app includes delays between requests to avoid rate limiting
 - **Quota**: Affluences has booking quotas - respect their limits
 - **Email**: Only works with Gmail (uses IMAP)

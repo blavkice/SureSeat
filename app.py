@@ -15,7 +15,7 @@ import hashlib
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Selenium Imports
+# selenium imports
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -32,6 +32,16 @@ USER_AGENTS_LIST = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 ]
+
+# add visual indicators for night hours (00:00-06:30)
+ORARI_DISPLAY = []
+for h in range(24):
+    for m in (0, 30):
+        time_str = f"{h:02d}:{m:02d}"
+        if 0 <= h < 7:
+            ORARI_DISPLAY.append(f"🌙 {time_str}")
+        else:
+            ORARI_DISPLAY.append(time_str)
 
 ORARI = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)]
 
@@ -124,7 +134,7 @@ def kill_stale_chrome_processes():
     except:
         pass
 
-def aggiorna_fine(idx):
+def update_end_time(idx):
     try:
         slot = st.session_state.time_slots[idx]
         start_idx = ORARI.index(slot["start"])
@@ -132,6 +142,17 @@ def aggiorna_fine(idx):
         slot["end"] = ORARI[end_idx]
     except:
         pass
+
+def on_start_change(idx):
+    new_start = st.session_state[f"start_{idx}"]
+    st.session_state.time_slots[idx]["start"] = new_start
+    
+    start_idx = ORARI.index(new_start)
+    end_idx = (start_idx + 8) % len(ORARI)
+    new_end = ORARI[end_idx]
+    
+    st.session_state.time_slots[idx]["end"] = new_end
+    st.session_state[f"end_{idx}"] = new_end
 
 def get_random_headers():
     return {
@@ -144,14 +165,14 @@ def get_random_headers():
 
 # core logic
 
-def prenota_slot(user_email, data, ora_inizio, ora_fine, resource_id):
+def book_slot(user_email, date, start_time, end_time, resource_id):
     url = f"https://reservation.affluences.com/api/reserve/{resource_id}"
     headers = get_random_headers()
     payload = {
         "email": user_email,
-        "date": data.strftime("%Y-%m-%d"),
-        "start_time": ora_inizio,
-        "end_time": ora_fine,
+        "date": date.strftime("%Y-%m-%d"),
+        "start_time": start_time,
+        "end_time": end_time,
         "person_count": 1,
         "note": "Reservation"
     }
@@ -159,8 +180,8 @@ def prenota_slot(user_email, data, ora_inizio, ora_fine, resource_id):
         res = requests.post(url, headers=headers, json=payload)
         if res.status_code in [200, 201]: return True, "Sent"
         elif res.status_code == 400 and "quota" in res.text.lower(): return False, "Quota Limit"
-        else: return False, f"Err {res.status_code}"
-    except Exception as e: return False, "Conn Error"
+        else: return False, "❌ Not Reserved"
+    except Exception as e: return False, "❌ Connection Error"
 
 def get_email_links(mail_user, mail_app_password):
     found_items = []
@@ -193,15 +214,15 @@ def get_email_links(mail_user, mail_app_password):
             match_link = re.search(r'(https://affluences\.com.*?/reservation/confirm\?reservationToken=[a-zA-Z0-9-]+)', body)
 
             if match_link and match_data:
-                giorno = int(match_data.group(1))
-                mese_str = match_data.group(2).lower()
-                anno = int(match_data.group(3))
-                mese = MONTHS_IT.get(mese_str, 0)
+                day = int(match_data.group(1))
+                month_str = match_data.group(2).lower()
+                year = int(match_data.group(3))
+                month = MONTHS_IT.get(month_str, 0)
                 
                 try:
-                    data_obj = datetime(anno, mese, giorno).date()
-                    link_pulito = match_link.group(1).replace("&amp;", "&")
-                    found_items.append({'date': data_obj, 'link': link_pulito})
+                    date_obj = datetime(year, month, day).date()
+                    clean_link = match_link.group(1).replace("&amp;", "&")
+                    found_items.append({'date': date_obj, 'link': clean_link})
                 except: pass
         
         return found_items
@@ -241,15 +262,15 @@ def get_recent_email_links(mail_user, mail_app_password, hours=3):
             match_link = re.search(r'(https://affluences\.com.*?/reservation/confirm\?reservationToken=[a-zA-Z0-9-]+)', body)
 
             if match_link and match_data:
-                giorno = int(match_data.group(1))
-                mese_str = match_data.group(2).lower()
-                anno = int(match_data.group(3))
-                mese = MONTHS_IT.get(mese_str, 0)
+                day = int(match_data.group(1))
+                month_str = match_data.group(2).lower()
+                year = int(match_data.group(3))
+                month = MONTHS_IT.get(month_str, 0)
                 
                 try:
-                    data_obj = datetime(anno, mese, giorno).date()
-                    link_pulito = match_link.group(1).replace("&amp;", "&")
-                    found_items.append({'date': data_obj, 'link': link_pulito})
+                    date_obj = datetime(year, month, day).date()
+                    clean_link = match_link.group(1).replace("&amp;", "&")
+                    found_items.append({'date': date_obj, 'link': clean_link})
                 except: pass
         
         return found_items
@@ -258,8 +279,8 @@ def get_recent_email_links(mail_user, mail_app_password, hours=3):
 
 def selenium_worker(task_data):
     """
-    Worker ottimizzato: riceve il driver_path già pronto.
-    Aggiunto retry logic per gestire daemon conflicts.
+    optimized worker: receives driver_path already prepared.
+    added retry logic to handle daemon conflicts.
     """
     link = task_data['link']
     idx = task_data['index']
@@ -275,31 +296,31 @@ def selenium_worker(task_data):
             chrome_options.add_argument("--headless") 
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
-            # Disabilita immagini e GPU per velocità estrema
+            # disable images and gpu for speed
             chrome_options.add_argument("--disable-gpu")
             chrome_options.add_argument("--blink-settings=imagesEnabled=false") 
-            chrome_options.add_argument("--disable-extensions")  # Evita conflitti daemon
+            chrome_options.add_argument("--disable-extensions")  # avoid daemon conflicts
             chrome_options.add_argument("--disable-plugins")
             chrome_options.add_argument("--disable-software-rasterizer")
             chrome_options.add_argument(f"user-agent={random.choice(USER_AGENTS_LIST)}")
 
-            # Usa il driver già scaricato, niente check online
+            # use already downloaded driver, no online check
             service = Service(executable_path=driver_path)
             driver = webdriver.Chrome(service=service, options=chrome_options)
             
-            # Timeout più lungo per pagine lente
+            # longer timeout for slow pages
             driver.set_page_load_timeout(20)
             driver.set_script_timeout(20)
             
-            # Carica la pagina
+            # load page
             driver.get(link)
             
-            # Aspetta che la pagina sia completamente caricata
+            # wait for page to fully load
             wait = WebDriverWait(driver, 15)
             
             try:
-                # Cerca vari tipi di pulsanti/link di conferma
-                # Prova diversi selettori in ordine
+                # search for various confirm button/link types
+                # try different selectors in order
                 button_selectors = [
                     "//a[contains(@href, 'confirm') or contains(@href, 'conferma')]",
                     "//button[contains(text(), 'Conferma') or contains(text(), 'Confirm')]",
@@ -312,10 +333,10 @@ def selenium_worker(task_data):
                 for selector in button_selectors:
                     try:
                         btn = wait.until(EC.presence_of_element_located((By.XPATH, selector)))
-                        # Scroll al pulsante per sicurezza
+                        # scroll to button for safety
                         driver.execute_script("arguments[0].scrollIntoView(true);", btn)
                         time.sleep(0.5)
-                        # Attendi che sia cliccabile
+                        # wait until clickable
                         btn = wait.until(EC.element_to_be_clickable((By.XPATH, selector)))
                         break
                     except:
@@ -323,31 +344,31 @@ def selenium_worker(task_data):
                 
                 if btn:
                     btn.click()
-                    # Aspetta redirect/conferma
+                    # wait for redirect/confirmation
                     time.sleep(3)
                     
-                    # Verifica successo nella pagina risultante
+                    # verify success in resulting page
                     page_content = driver.page_source.lower()
                     if any(keyword in page_content for keyword in ["success", "confermata", "confirmed", "validata", "prenotazione confermata"]):
                         return {'index': idx, 'success': True}
                     else:
                         return {'index': idx, 'success': False, 'error': 'No success confirmation after click'}
                 else:
-                    # Nessun pulsante trovato - controlla se già confermata
+                    # no button found - check if already confirmed
                     page_content = driver.page_source.lower()
                     if any(keyword in page_content for keyword in ["già confermata", "already confirmed", "prenotazione confermata"]):
                         return {'index': idx, 'success': True}
                     return {'index': idx, 'success': False, 'error': 'Confirm button not found'}
                     
             except Exception as btn_error:
-                # Fallback: controlla se la pagina mostra già la conferma
+                # fallback: check if page already shows confirmation
                 page_content = driver.page_source.lower()
                 if any(keyword in page_content for keyword in ["già confermata", "already confirmed", "success", "confermata"]):
                     return {'index': idx, 'success': True}
                 return {'index': idx, 'success': False, 'error': f'Error: {str(btn_error)[:100]}'}
             
         except Exception as e:
-            # Retry logic for daemon conflicts
+            # retry logic for daemon conflicts
             if retry_count < max_retries and (("chrome" in str(e).lower()) or ("connection" in str(e).lower())):
                 retry_count += 1
                 if driver:
@@ -383,7 +404,7 @@ if not st.session_state.email_user or not st.session_state.email_pass:
 with st.sidebar:
     st.header("Configuration")
     
-    # Email Configuration
+    # email configuration
     with st.expander("Email Settings", expanded=not st.session_state.email_user):
         email_user = st.text_input("Gmail Address", value=st.session_state.email_user, key="email_input")
         email_pass = st.text_input("App Password", value=st.session_state.email_pass, type="password", key="pass_input", 
@@ -409,7 +430,7 @@ with st.sidebar:
                 st.session_state.email_pass = ""
                 st.rerun()
     
-    # Places Management
+    # places management
     st.subheader("Places")
     
     with st.expander("Add New Place", expanded=len(st.session_state.places) == 0):
@@ -456,7 +477,7 @@ with st.sidebar:
         time.sleep(0.5)
         os.kill(os.getpid(), signal.SIGTERM)
 
-# Main area - check prerequisites
+# main area - check prerequisites
 if not st.session_state.email_user or not st.session_state.email_pass:
     st.warning("Please configure your email in the sidebar first")
     st.stop()
@@ -465,7 +486,7 @@ if not st.session_state.places:
     st.warning("Please add at least one place in the sidebar")
     st.stop()
 
-# Place selector
+# place selector
 selected_place = st.selectbox(
     "Select Place to Book",
     options=range(len(st.session_state.places)),
@@ -490,16 +511,18 @@ with col2:
 with col3:
     st.write("") # spacing
 
-# Time Slots Section
+# time Slots Section
 st.subheader("Time Slots")
 slot_cols = st.columns([3, 3, 1])
 
 for idx, slot in enumerate(st.session_state.time_slots):
     col_a, col_b, col_c = st.columns([3, 3, 1])
     with col_a:
-        slot["start"] = st.selectbox(f"Start {idx+1}", ORARI, index=ORARI.index(slot["start"]), key=f"start_{idx}", on_change=aggiorna_fine, args=(idx,))
+        st.selectbox(f"Start {idx+1}", ORARI, format_func=lambda x: ORARI_DISPLAY[ORARI.index(x)], index=ORARI.index(slot["start"]), key=f"start_{idx}", on_change=on_start_change, args=(idx,))
     with col_b:
-        slot["end"] = st.selectbox(f"End {idx+1}", ORARI, index=ORARI.index(slot["end"]), key=f"end_{idx}")
+        if f"end_{idx}" not in st.session_state:
+            st.session_state[f"end_{idx}"] = slot["end"]
+        st.selectbox(f"End {idx+1}", ORARI, format_func=lambda x: ORARI_DISPLAY[ORARI.index(x)], key=f"end_{idx}")
     with col_c:
         if len(st.session_state.time_slots) > 1:
             if st.button("X", key=f"remove_{idx}", help="Remove slot"):
@@ -518,7 +541,7 @@ with slot_btn_col2:
 
 st.divider()
 
-# Buttons side by side
+# buttons side by side
 btn_col1, btn_col2 = st.columns([1, 1])
 with btn_col1:
     total_bookings = len(dates) * len(st.session_state.time_slots)
@@ -562,7 +585,7 @@ if launch_btn:
                     slot_start = time_parts[0]
                     slot_end = time_parts[1]
                     
-                    ok, msg = prenota_slot(email_user, d, slot_start, slot_end, res_id)
+                    ok, msg = book_slot(email_user, d, slot_start, slot_end, res_id)
                     if ok:
                         st.session_state.history[i]["Status"] = "Sent"
                     else:
@@ -613,7 +636,7 @@ if launch_btn:
                             res = future.result()
                             idx = res['index']
                             if res['success']:
-                                st.session_state.history[idx]["Status"] = "CONFIRMED"
+                                st.session_state.history[idx]["Status"] = "✓ CONFIRMED"
                                 st.session_state.history[idx]["Confirmed"] = True
                             else:
                                 st.session_state.history[idx]["Status"] = "Retry..."
@@ -628,9 +651,13 @@ if launch_btn:
                 if not r["Confirmed"] and "Sent" in r["Status"]:
                      st.session_state.history[i]["Status"] = "Timeout"
             dashboard.dataframe(pd.DataFrame(st.session_state.history))
-            st.balloons()
+            st.success("Process completed")
+            
+            failed_count = len([r for r in st.session_state.history if "Non effettuata" in r["Status"]])
+            if failed_count > 0:
+                st.info(f"ℹ️ {failed_count} booking(s) not completed - likely the slot was already occupied or unavailable")
 
-# Validate only mode
+# validate only mode
 if validate_btn:
     if not email_pass:
         st.error("No password.")
@@ -654,7 +681,7 @@ if validate_btn:
         else:
             st.info(f"Found {len(found_emails)} confirmation email(s)")
             
-            # Create validation tasks
+            # create validation tasks
             validated_results = []
             failed_results = []
             tasks = []
@@ -679,7 +706,7 @@ if validate_btn:
                     if res['success']:
                         validated_results.append({
                             'Date': task['date'],
-                            'Status': 'VALIDATED'
+                            'Status': '✓ VALIDATED'
                         })
                     else:
                         failed_results.append({
@@ -696,7 +723,6 @@ if validate_btn:
                     lambda x: 'background-color: #d4edda; color: black' if 'VALIDATED' in str(x) else '', 
                     subset=['Status']
                 ), use_container_width=True)
-                st.balloons()
             
             if failed_results:
                 st.error(f"Failed to validate {len(failed_results)} reservation(s)")
@@ -712,8 +738,8 @@ if st.session_state.history:
     df = pd.DataFrame(st.session_state.history)[["DateStr", "TimeSlot", "Status"]]
     def color_rows(val):
         color = 'white'
-        if 'CONFIRMED' in val: color = '#d4edda'
+        if '✓ CONFIRMED' in val or '✓ VALIDATED' in val: color = '#d4edda'
         elif 'Sent' in val: color = '#fff3cd'
-        elif 'Timeout' in val or 'Error' in val: color = '#f8d7da'
+        elif 'Timeout' in val or '❌' in val or 'Not Reserved' in val: color = '#f8d7da'
         return f'background-color: {color}; color: black'
     st.dataframe(df.style.map(color_rows, subset=['Status']), use_container_width=True)
