@@ -119,6 +119,7 @@ If you encounter Chrome daemon conflicts:
 
 ## Notes
 
+- **Language**: Currently only works with Italian emails (searches for "gennaio", "febbraio", etc.)
 - **Rate Limiting**: The app includes delays between requests to avoid rate limiting
 - **Quota**: Affluences has booking quotas - respect their limits
 - **Email**: Only works with Gmail (uses IMAP)

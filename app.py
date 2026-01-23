@@ -35,7 +35,8 @@ USER_AGENTS_LIST = [
 
 ORARI = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)]
 
-MESI = {
+# italian month names for email parsing
+MONTHS_IT = {
     "gennaio": 1, "febbraio": 2, "marzo": 3, "aprile": 4, "maggio": 5, "giugno": 6,
     "luglio": 7, "agosto": 8, "settembre": 9, "ottobre": 10, "novembre": 11, "dicembre": 12
 }
@@ -141,7 +142,7 @@ def get_random_headers():
         'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7'
     }
 
-# --- CORE LOGIC ---
+# core logic
 
 def prenota_slot(user_email, data, ora_inizio, ora_fine, resource_id):
     url = f"https://reservation.affluences.com/api/reserve/{resource_id}"
@@ -195,7 +196,7 @@ def get_email_links(mail_user, mail_app_password):
                 giorno = int(match_data.group(1))
                 mese_str = match_data.group(2).lower()
                 anno = int(match_data.group(3))
-                mese = MESI.get(mese_str, 0)
+                mese = MONTHS_IT.get(mese_str, 0)
                 
                 try:
                     data_obj = datetime(anno, mese, giorno).date()
@@ -214,10 +215,8 @@ def get_recent_email_links(mail_user, mail_app_password, hours=3):
         mail.login(mail_user, mail_app_password)
         mail.select("inbox")
 
-        # Calculate date for search (3 hours ago)
         since_date = (datetime.now() - timedelta(hours=hours)).strftime("%d-%b-%Y")
         
-        # Search for emails from the last 3 hours
         status, messages = mail.search(None, f'(SINCE {since_date} FROM "no-reply@affluences.com")')
         if not messages[0]:
             status, messages = mail.search(None, f'(SINCE {since_date} FROM "Affluences")')
@@ -245,7 +244,7 @@ def get_recent_email_links(mail_user, mail_app_password, hours=3):
                 giorno = int(match_data.group(1))
                 mese_str = match_data.group(2).lower()
                 anno = int(match_data.group(3))
-                mese = MESI.get(mese_str, 0)
+                mese = MONTHS_IT.get(mese_str, 0)
                 
                 try:
                     data_obj = datetime(anno, mese, giorno).date()
