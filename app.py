@@ -1,5 +1,7 @@
 import streamlit as st
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import imaplib
 import email
 import re
@@ -14,6 +16,22 @@ import base64
 import hashlib
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# HTTP Session with connection pooling
+def get_http_session():
+    """Create a reusable HTTP session with connection pooling and retries."""
+    if 'http_session' not in st.session_state:
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=2,
+            backoff_factor=0.3,
+            status_forcelist=[500, 502, 503, 504]
+        )
+        adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=retry_strategy)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        st.session_state.http_session = session
+    return st.session_state.http_session
 
 # selenium imports
 from selenium import webdriver
@@ -165,7 +183,8 @@ def get_random_headers():
 
 # core logic
 
-def book_slot(user_email, date, start_time, end_time, resource_id):
+def book_slot(user_email, date, start_time, end_time, resource_id, session=None):
+    """Book a slot using connection-pooled session."""
     url = f"https://reservation.affluences.com/api/reserve/{resource_id}"
     headers = get_random_headers()
     payload = {
@@ -177,150 +196,181 @@ def book_slot(user_email, date, start_time, end_time, resource_id):
         "note": "Reservation"
     }
     try:
-        res = requests.post(url, headers=headers, json=payload)
+        http = session or requests
+        res = http.post(url, headers=headers, json=payload, timeout=10)
         if res.status_code in [200, 201]: return True, "Sent"
         elif res.status_code == 400 and "quota" in res.text.lower(): return False, "Quota Limit"
         else: return False, "❌ Not Reserved"
     except Exception as e: return False, "❌ Connection Error"
 
-def get_email_links(mail_user, mail_app_password):
-    found_items = []
+def book_slot_worker(args):
+    """Worker for parallel booking."""
+    user_email, date, start_time, end_time, resource_id, session = args
+    return book_slot(user_email, date, start_time, end_time, resource_id, session)
+
+def _parse_email_body(msg):
+    """Extract body from email message."""
+    body = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/html":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    body = payload.decode(errors="ignore")
+                    break
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload: body = payload.decode(errors="ignore")
+    return body
+
+def _extract_reservation_from_body(body):
+    """Extract date and confirmation link from email body."""
+    match_data = re.search(r'(\d{1,2})\s+(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)\s+(\d{4})', body, re.IGNORECASE)
+    match_link = re.search(r'(https://affluences\.com.*?/reservation/confirm\?reservationToken=[a-zA-Z0-9-]+)', body)
+
+    if match_link and match_data:
+        day = int(match_data.group(1))
+        month_str = match_data.group(2).lower()
+        year = int(match_data.group(3))
+        month = MONTHS_IT.get(month_str, 0)
+
+        try:
+            date_obj = datetime(year, month, day).date()
+            clean_link = match_link.group(1).replace("&amp;", "&")
+            return {'date': date_obj, 'link': clean_link}
+        except:
+            pass
+    return None
+
+def get_imap_connection(mail_user, mail_app_password):
+    """Get or create persistent IMAP connection."""
+    if 'imap_connection' not in st.session_state or st.session_state.imap_connection is None:
+        try:
+            mail = imaplib.IMAP4_SSL(IMAP_SERVER)
+            mail.login(mail_user, mail_app_password)
+            st.session_state.imap_connection = mail
+        except Exception as e:
+            return None
+
+    # Verify connection is still alive
     try:
-        mail = imaplib.IMAP4_SSL(IMAP_SERVER)
-        mail.login(mail_user, mail_app_password)
+        st.session_state.imap_connection.noop()
+    except:
+        try:
+            mail = imaplib.IMAP4_SSL(IMAP_SERVER)
+            mail.login(mail_user, mail_app_password)
+            st.session_state.imap_connection = mail
+        except:
+            return None
+
+    return st.session_state.imap_connection
+
+def close_imap_connection():
+    """Close IMAP connection if exists."""
+    if 'imap_connection' in st.session_state and st.session_state.imap_connection:
+        try:
+            st.session_state.imap_connection.logout()
+        except:
+            pass
+        st.session_state.imap_connection = None
+
+def get_email_links(mail_user, mail_app_password, hours=None, use_persistent=False):
+    """
+    Unified function to get email confirmation links.
+
+    Args:
+        hours: If set, search emails from last N hours. If None, search UNSEEN emails.
+        use_persistent: If True, use persistent IMAP connection (faster for polling).
+    """
+    found_items = []
+    mail = None
+
+    try:
+        if use_persistent:
+            mail = get_imap_connection(mail_user, mail_app_password)
+            if not mail:
+                return []
+        else:
+            mail = imaplib.IMAP4_SSL(IMAP_SERVER)
+            mail.login(mail_user, mail_app_password)
+
         mail.select("inbox")
 
-        status, messages = mail.search(None, '(UNSEEN FROM "no-reply@affluences.com")')
-        if not messages[0]:
-             status, messages = mail.search(None, '(UNSEEN FROM "Affluences")')
-        
+        # Build search query
+        if hours is not None:
+            since_date = (datetime.now() - timedelta(hours=hours)).strftime("%d-%b-%Y")
+            status, messages = mail.search(None, f'(SINCE {since_date} FROM "no-reply@affluences.com")')
+            if not messages[0]:
+                status, messages = mail.search(None, f'(SINCE {since_date} FROM "Affluences")')
+        else:
+            status, messages = mail.search(None, '(UNSEEN FROM "no-reply@affluences.com")')
+            if not messages[0]:
+                status, messages = mail.search(None, '(UNSEEN FROM "Affluences")')
+
         mail_ids = messages[0].split()
-        
+
         for email_id in mail_ids:
             _, data = mail.fetch(email_id, '(RFC822)')
             msg = email.message_from_bytes(data[0][1])
-            
-            body = ""
-            if msg.is_multipart():
-                for part in msg.walk():
-                    if part.get_content_type() == "text/html":
-                        payload = part.get_payload(decode=True)
-                        if payload: body = payload.decode(errors="ignore")
-            else:
-                payload = msg.get_payload(decode=True)
-                if payload: body = payload.decode(errors="ignore")
+            body = _parse_email_body(msg)
+            reservation = _extract_reservation_from_body(body)
+            if reservation:
+                found_items.append(reservation)
 
-            match_data = re.search(r'(\d{1,2})\s+(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)\s+(\d{4})', body, re.IGNORECASE)
-            match_link = re.search(r'(https://affluences\.com.*?/reservation/confirm\?reservationToken=[a-zA-Z0-9-]+)', body)
-
-            if match_link and match_data:
-                day = int(match_data.group(1))
-                month_str = match_data.group(2).lower()
-                year = int(match_data.group(3))
-                month = MONTHS_IT.get(month_str, 0)
-                
-                try:
-                    date_obj = datetime(year, month, day).date()
-                    clean_link = match_link.group(1).replace("&amp;", "&")
-                    found_items.append({'date': date_obj, 'link': clean_link})
-                except: pass
-        
         return found_items
     except Exception as e:
         return []
+    finally:
+        if not use_persistent and mail:
+            try:
+                mail.logout()
+            except:
+                pass
 
 def get_recent_email_links(mail_user, mail_app_password, hours=3):
-    found_items = []
-    try:
-        mail = imaplib.IMAP4_SSL(IMAP_SERVER)
-        mail.login(mail_user, mail_app_password)
-        mail.select("inbox")
-
-        since_date = (datetime.now() - timedelta(hours=hours)).strftime("%d-%b-%Y")
-        
-        status, messages = mail.search(None, f'(SINCE {since_date} FROM "no-reply@affluences.com")')
-        if not messages[0]:
-            status, messages = mail.search(None, f'(SINCE {since_date} FROM "Affluences")')
-        
-        mail_ids = messages[0].split()
-        
-        for email_id in mail_ids:
-            _, data = mail.fetch(email_id, '(RFC822)')
-            msg = email.message_from_bytes(data[0][1])
-            
-            body = ""
-            if msg.is_multipart():
-                for part in msg.walk():
-                    if part.get_content_type() == "text/html":
-                        payload = part.get_payload(decode=True)
-                        if payload: body = payload.decode(errors="ignore")
-            else:
-                payload = msg.get_payload(decode=True)
-                if payload: body = payload.decode(errors="ignore")
-
-            match_data = re.search(r'(\d{1,2})\s+(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)\s+(\d{4})', body, re.IGNORECASE)
-            match_link = re.search(r'(https://affluences\.com.*?/reservation/confirm\?reservationToken=[a-zA-Z0-9-]+)', body)
-
-            if match_link and match_data:
-                day = int(match_data.group(1))
-                month_str = match_data.group(2).lower()
-                year = int(match_data.group(3))
-                month = MONTHS_IT.get(month_str, 0)
-                
-                try:
-                    date_obj = datetime(year, month, day).date()
-                    clean_link = match_link.group(1).replace("&amp;", "&")
-                    found_items.append({'date': date_obj, 'link': clean_link})
-                except: pass
-        
-        return found_items
-    except Exception as e:
-        return []
+    """Backwards compatible wrapper."""
+    return get_email_links(mail_user, mail_app_password, hours=hours)
 
 def selenium_worker(task_data):
     """
-    optimized worker: receives driver_path already prepared.
-    added retry logic to handle daemon conflicts.
+    Optimized worker with reduced timeouts (7s).
+    Receives driver_path already prepared.
     """
     link = task_data['link']
     idx = task_data['index']
     driver_path = task_data['driver_path']
-    
+
     driver = None
     retry_count = 0
     max_retries = 2
-    
+
     while retry_count <= max_retries:
         try:
             chrome_options = Options()
-            chrome_options.add_argument("--headless") 
+            chrome_options.add_argument("--headless")
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
-            # disable images and gpu for speed
             chrome_options.add_argument("--disable-gpu")
-            chrome_options.add_argument("--blink-settings=imagesEnabled=false") 
-            chrome_options.add_argument("--disable-extensions")  # avoid daemon conflicts
+            chrome_options.add_argument("--blink-settings=imagesEnabled=false")
+            chrome_options.add_argument("--disable-extensions")
             chrome_options.add_argument("--disable-plugins")
             chrome_options.add_argument("--disable-software-rasterizer")
+            chrome_options.add_argument("--disable-logging")
+            chrome_options.add_argument("--log-level=3")
             chrome_options.add_argument(f"user-agent={random.choice(USER_AGENTS_LIST)}")
 
-            # use already downloaded driver, no online check
             service = Service(executable_path=driver_path)
             driver = webdriver.Chrome(service=service, options=chrome_options)
-            
-            # longer timeout for slow pages
-            driver.set_page_load_timeout(20)
-            driver.set_script_timeout(20)
-            
-            # load page
+
+            # Reduced timeouts (7s)
+            driver.set_page_load_timeout(7)
+            driver.set_script_timeout(7)
+
             driver.get(link)
-            
-            # wait for page to fully load
-            wait = WebDriverWait(driver, 15)
-            
+
+            wait = WebDriverWait(driver, 7)
+
             try:
-                # search for various confirm button/link types
-                # try different selectors in order
                 button_selectors = [
                     "//a[contains(@href, 'confirm') or contains(@href, 'conferma')]",
                     "//button[contains(text(), 'Conferma') or contains(text(), 'Confirm')]",
@@ -328,63 +378,64 @@ def selenium_worker(task_data):
                     "//input[@type='submit' and (contains(@value, 'Conferma') or contains(@value, 'Confirm'))]",
                     "//*[@role='button' and (contains(text(), 'Conferma') or contains(text(), 'Confirm'))]"
                 ]
-                
+
                 btn = None
                 for selector in button_selectors:
                     try:
                         btn = wait.until(EC.presence_of_element_located((By.XPATH, selector)))
-                        # scroll to button for safety
                         driver.execute_script("arguments[0].scrollIntoView(true);", btn)
-                        time.sleep(0.5)
-                        # wait until clickable
                         btn = wait.until(EC.element_to_be_clickable((By.XPATH, selector)))
                         break
                     except:
                         continue
-                
+
                 if btn:
                     btn.click()
-                    # wait for redirect/confirmation
-                    time.sleep(3)
-                    
-                    # verify success in resulting page
+                    time.sleep(1.5)  # Reduced from 3s
+
                     page_content = driver.page_source.lower()
                     if any(keyword in page_content for keyword in ["success", "confermata", "confirmed", "validata", "prenotazione confermata"]):
                         return {'index': idx, 'success': True}
                     else:
                         return {'index': idx, 'success': False, 'error': 'No success confirmation after click'}
                 else:
-                    # no button found - check if already confirmed
                     page_content = driver.page_source.lower()
                     if any(keyword in page_content for keyword in ["già confermata", "already confirmed", "prenotazione confermata"]):
                         return {'index': idx, 'success': True}
                     return {'index': idx, 'success': False, 'error': 'Confirm button not found'}
-                    
+
             except Exception as btn_error:
-                # fallback: check if page already shows confirmation
                 page_content = driver.page_source.lower()
                 if any(keyword in page_content for keyword in ["già confermata", "already confirmed", "success", "confermata"]):
                     return {'index': idx, 'success': True}
                 return {'index': idx, 'success': False, 'error': f'Error: {str(btn_error)[:100]}'}
-            
+
         except Exception as e:
-            # retry logic for daemon conflicts
             if retry_count < max_retries and (("chrome" in str(e).lower()) or ("connection" in str(e).lower())):
                 retry_count += 1
                 if driver:
                     try: driver.quit()
                     except: pass
-                time.sleep(0.5)  # Brief wait before retry
+                time.sleep(0.3)  # Reduced from 0.5s
                 continue
             return {'index': idx, 'success': False, 'error': str(e)}
         finally:
-            if driver: 
+            if driver:
                 try: driver.quit()
                 except: pass
         break
 
 st.set_page_config(page_title="SureSeat", layout="wide")
 st.title("SureSeat")
+
+# Pre-cache ChromeDriver at startup (runs once per session)
+@st.cache_resource(show_spinner=False)
+def get_cached_driver_path():
+    """Cache ChromeDriver path to avoid repeated downloads."""
+    try:
+        return ChromeDriverManager().install()
+    except Exception:
+        return None
 
 if "history" not in st.session_state: st.session_state.history = []
 if "time_slots" not in st.session_state: st.session_state.time_slots = [{"start": "14:00", "end": "18:00"}]
@@ -550,88 +601,111 @@ with btn_col2:
     validate_btn = st.button("VALIDATE ONLY (Last 3h)", type="secondary", use_container_width=True)
 
 if launch_btn:
-        if not email_pass:
-            st.error("No password.")
-        else:
-            with st.spinner("Cleaning up stale Chrome processes..."):
-                kill_stale_chrome_processes()
-                time.sleep(1)
-            
-            with st.spinner("Pre-loading Chrome Driver..."):
-                try:
-                    cached_driver_path = ChromeDriverManager().install()
-                except Exception as e:
-                    st.error(f"Failed to load driver: {e}")
-                    st.stop()
+    if not email_pass:
+        st.error("No password.")
+    else:
+        with st.spinner("Cleaning up stale Chrome processes..."):
+            kill_stale_chrome_processes()
+            time.sleep(0.5)  # Reduced from 1s
 
-            st.session_state.history = []
-            for d in dates:
-                for slot_idx, slot in enumerate(st.session_state.time_slots):
-                    st.session_state.history.append({
-                        "Date": d, 
-                        "DateStr": d.strftime("%Y-%m-%d"),
-                        "TimeSlot": f"{slot['start']}-{slot['end']}",
-                        "Status": "Pending", 
-                        "Confirmed": False
-                    })
-            
-            dashboard = st.empty()
-            dashboard.dataframe(pd.DataFrame(st.session_state.history))
-            
-            with st.status("Phase 1: API Requests...", expanded=True) as status:
-                for i, record in enumerate(st.session_state.history):
-                    d = record["Date"]
-                    time_parts = record["TimeSlot"].split("-")
-                    slot_start = time_parts[0]
-                    slot_end = time_parts[1]
-                    
-                    ok, msg = book_slot(email_user, d, slot_start, slot_end, res_id)
-                    if ok:
-                        st.session_state.history[i]["Status"] = "Sent"
-                    else:
-                        st.session_state.history[i]["Status"] = f"Error: {msg}"
-                        st.session_state.history[i]["Confirmed"] = True 
-                    
-                    dashboard.dataframe(pd.DataFrame(st.session_state.history))
-                    time.sleep(random.uniform(0.3, 1.0))
-                status.update(label="Requests sent.", state="complete")
+        # Use cached driver path
+        cached_driver_path = get_cached_driver_path()
+        if not cached_driver_path:
+            st.error("Failed to load Chrome driver")
+            st.stop()
 
-            time.sleep(4) 
+        # Get HTTP session for connection pooling
+        http_session = get_http_session()
 
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            start_time = time.time()
-            timeout = 30 
-            
+        st.session_state.history = []
+        for d in dates:
+            for slot_idx, slot in enumerate(st.session_state.time_slots):
+                st.session_state.history.append({
+                    "Date": d,
+                    "DateStr": d.strftime("%Y-%m-%d"),
+                    "TimeSlot": f"{slot['start']}-{slot['end']}",
+                    "Status": "Pending",
+                    "Confirmed": False
+                })
+
+        dashboard = st.empty()
+        dashboard.dataframe(pd.DataFrame(st.session_state.history))
+
+        with st.status("Phase 1: API Requests (parallel)...", expanded=True) as status:
+            # Prepare batch requests
+            batch_tasks = []
+            for i, record in enumerate(st.session_state.history):
+                d = record["Date"]
+                time_parts = record["TimeSlot"].split("-")
+                slot_start = time_parts[0]
+                slot_end = time_parts[1]
+                batch_tasks.append((i, email_user, d, slot_start, slot_end, res_id, http_session))
+
+            # Execute API requests in parallel (batch of 3 for rate limiting)
+            batch_size = 3
+            for batch_start in range(0, len(batch_tasks), batch_size):
+                batch = batch_tasks[batch_start:batch_start + batch_size]
+
+                with ThreadPoolExecutor(max_workers=batch_size) as executor:
+                    futures = {}
+                    for task in batch:
+                        idx, u_email, d, s_start, s_end, r_id, sess = task
+                        future = executor.submit(book_slot, u_email, d, s_start, s_end, r_id, sess)
+                        futures[future] = idx
+
+                    for future in as_completed(futures):
+                        idx = futures[future]
+                        ok, msg = future.result()
+                        if ok:
+                            st.session_state.history[idx]["Status"] = "Sent"
+                        else:
+                            st.session_state.history[idx]["Status"] = f"Error: {msg}"
+                            st.session_state.history[idx]["Confirmed"] = True
+
+                dashboard.dataframe(pd.DataFrame(st.session_state.history))
+                if batch_start + batch_size < len(batch_tasks):
+                    time.sleep(random.uniform(0.2, 0.5))  # Small delay between batches
+
+            status.update(label="Requests sent.", state="complete")
+
+        time.sleep(2)  # Reduced from 4s
+
+        status_text = st.empty()
+
+        start_time = time.time()
+        timeout = 30
+
+        try:
             while (time.time() - start_time) < timeout:
-                pending_indices = [i for i, r in enumerate(st.session_state.history) 
+                pending_indices = [i for i, r in enumerate(st.session_state.history)
                                    if not r["Confirmed"] and "Sent" in r["Status"]]
-                
-                if not pending_indices: break
+
+                if not pending_indices:
+                    break
 
                 status_text.write(f"Checking inbox... ({int(timeout - (time.time()-start_time))}s left)")
-                
-                found_emails = get_email_links(email_user, email_pass)
-                
+
+                # Use persistent IMAP connection
+                found_emails = get_email_links(email_user, email_pass, use_persistent=True)
+
                 tasks = []
                 for email_item in found_emails:
                     m_date = email_item['date']
                     m_link = email_item['link']
-                    
+
                     for idx in pending_indices:
                         rec = st.session_state.history[idx]
                         if rec["Date"] == m_date:
                             st.session_state.history[idx]["Status"] = "Validating..."
                             tasks.append({'index': idx, 'link': m_link, 'driver_path': cached_driver_path})
-                
+
                 dashboard.dataframe(pd.DataFrame(st.session_state.history))
-                
+
                 if tasks:
                     status_text.write(f"Launching {len(tasks)} selenium browsers...")
                     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                         futures = {executor.submit(selenium_worker, t): t for t in tasks}
-                        
+
                         for future in as_completed(futures):
                             res = future.result()
                             idx = res['index']
@@ -640,22 +714,24 @@ if launch_btn:
                                 st.session_state.history[idx]["Confirmed"] = True
                             else:
                                 st.session_state.history[idx]["Status"] = "Retry..."
-                    
-                    dashboard.dataframe(pd.DataFrame(st.session_state.history))
-                
-                time.sleep(3)
 
-            status_text.success("Finished.")
-            
-            for i, r in enumerate(st.session_state.history):
-                if not r["Confirmed"] and "Sent" in r["Status"]:
-                     st.session_state.history[i]["Status"] = "Timeout"
-            dashboard.dataframe(pd.DataFrame(st.session_state.history))
-            st.success("Process completed")
-            
-            failed_count = len([r for r in st.session_state.history if "Non effettuata" in r["Status"]])
-            if failed_count > 0:
-                st.info(f"ℹ️ {failed_count} booking(s) not completed - likely the slot was already occupied or unavailable")
+                    dashboard.dataframe(pd.DataFrame(st.session_state.history))
+
+                time.sleep(4)  # Slightly increased but with persistent connection = net faster
+        finally:
+            close_imap_connection()
+
+        status_text.success("Finished.")
+
+        for i, r in enumerate(st.session_state.history):
+            if not r["Confirmed"] and "Sent" in r["Status"]:
+                st.session_state.history[i]["Status"] = "Timeout"
+        dashboard.dataframe(pd.DataFrame(st.session_state.history))
+        st.success("Process completed")
+
+        failed_count = len([r for r in st.session_state.history if "Non effettuata" in r["Status"]])
+        if failed_count > 0:
+            st.info(f"ℹ️ {failed_count} booking(s) not completed - likely the slot was already occupied or unavailable")
 
 # validate only mode
 if validate_btn:
@@ -664,17 +740,16 @@ if validate_btn:
     else:
         with st.spinner("Cleaning up stale Chrome processes..."):
             kill_stale_chrome_processes()
-            time.sleep(1)
-        
-        with st.spinner("Loading Chrome Driver..."):
-            try:
-                cached_driver_path = ChromeDriverManager().install()
-            except Exception as e:
-                st.error(f"Failed to load driver: {e}")
-                st.stop()
-        
+            time.sleep(0.5)  # Reduced from 1s
+
+        # Use cached driver path
+        cached_driver_path = get_cached_driver_path()
+        if not cached_driver_path:
+            st.error("Failed to load Chrome driver")
+            st.stop()
+
         with st.spinner("Searching emails from last 3 hours..."):
-            found_emails = get_recent_email_links(email_user, email_pass, hours=3)
+            found_emails = get_email_links(email_user, email_pass, hours=3)
         
         if not found_emails:
             st.warning("No confirmation emails found in the last 3 hours.")
