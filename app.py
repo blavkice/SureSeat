@@ -63,11 +63,50 @@ for h in range(24):
 
 ORARI = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)]
 
-# italian month names for email parsing
-MONTHS_IT = {
-    "gennaio": 1, "febbraio": 2, "marzo": 3, "aprile": 4, "maggio": 5, "giugno": 6,
-    "luglio": 7, "agosto": 8, "settembre": 9, "ottobre": 10, "novembre": 11, "dicembre": 12
-}
+# load multilingual month names from csv
+def load_months():
+    months_file = os.path.join(os.path.dirname(__file__), "months.csv")
+    months = {}
+    try:
+        with open(months_file, 'r', encoding='utf-8') as f:
+            next(f)  # skip header
+            for line in f:
+                line = line.strip()
+                if line:
+                    name, num = line.rsplit(',', 1)
+                    months[name.lower()] = int(num)
+    except:
+        # fallback to english if csv not found
+        months = {"january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+                  "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12}
+    return months
+
+MONTHS = load_months()
+MONTHS_PATTERN = "|".join(re.escape(m) for m in MONTHS.keys())
+
+# load multilingual keywords for selenium scraping
+def load_keywords():
+    keywords_file = os.path.join(os.path.dirname(__file__), "keywords.csv")
+    keywords = {"button": [], "success": [], "already": []}
+    try:
+        with open(keywords_file, 'r', encoding='utf-8') as f:
+            next(f)  # skip header
+            for line in f:
+                line = line.strip()
+                if line:
+                    keyword, ktype = line.rsplit(',', 1)
+                    if ktype in keywords:
+                        keywords[ktype].append(keyword.lower())
+    except:
+        # fallback to basic english/italian
+        keywords = {
+            "button": ["confirm", "conferma"],
+            "success": ["success", "confirmed", "confermata", "validata"],
+            "already": ["already confirmed", "già confermata"]
+        }
+    return keywords
+
+KEYWORDS = load_keywords()
 
 def load_places():
     try:
@@ -225,14 +264,14 @@ def _parse_email_body(msg):
 
 def _extract_reservation_from_body(body):
     """Extract date and confirmation link from email body."""
-    match_data = re.search(r'(\d{1,2})\s+(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)\s+(\d{4})', body, re.IGNORECASE)
+    match_data = re.search(rf'(\d{{1,2}})\s+({MONTHS_PATTERN})\s+(\d{{4}})', body, re.IGNORECASE)
     match_link = re.search(r'(https://affluences\.com.*?/reservation/confirm\?reservationToken=[a-zA-Z0-9-]+)', body)
 
     if match_link and match_data:
         day = int(match_data.group(1))
         month_str = match_data.group(2).lower()
         year = int(match_data.group(3))
-        month = MONTHS_IT.get(month_str, 0)
+        month = MONTHS.get(month_str, 0)
 
         try:
             date_obj = datetime(year, month, day).date()
@@ -331,6 +370,55 @@ def get_recent_email_links(mail_user, mail_app_password, hours=3):
     """Backwards compatible wrapper."""
     return get_email_links(mail_user, mail_app_password, hours=hours)
 
+def delete_affluences_emails(mail_user, mail_app_password, days=7):
+    """
+    Delete all Affluences emails from the last N days.
+    Returns (found_count, deleted_count, error).
+    """
+    found_count = 0
+    deleted_count = 0
+    try:
+        mail = imaplib.IMAP4_SSL(IMAP_SERVER)
+        mail.login(mail_user, mail_app_password)
+        mail.select("inbox")
+
+        since_date = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
+
+        # search for all affluences emails
+        search_queries = [
+            f'(SINCE {since_date} FROM "no-reply@affluences.com")',
+            f'(SINCE {since_date} FROM "Affluences")',
+            f'(SINCE {since_date} SUBJECT "prenotazione")',
+            f'(SINCE {since_date} SUBJECT "reservation")',
+        ]
+
+        all_mail_ids = set()
+        for query in search_queries:
+            try:
+                _, messages = mail.search(None, query)
+                if messages[0]:
+                    all_mail_ids.update(messages[0].split())
+            except:
+                continue
+
+        found_count = len(all_mail_ids)
+
+        # mark emails for deletion
+        for email_id in all_mail_ids:
+            try:
+                mail.store(email_id, '+FLAGS', '\\Deleted')
+                deleted_count += 1
+            except:
+                continue
+
+        # permanently delete marked emails
+        mail.expunge()
+        mail.logout()
+
+        return found_count, deleted_count, None
+    except Exception as e:
+        return found_count, deleted_count, str(e)
+
 def selenium_worker(task_data):
     """
     Optimized worker with reduced timeouts (7s).
@@ -370,13 +458,23 @@ def selenium_worker(task_data):
 
             wait = WebDriverWait(driver, 7)
 
+            # get keywords for matching
+            button_keywords = KEYWORDS.get("button", ["confirm", "conferma"])
+            success_keywords = KEYWORDS.get("success", ["success", "confirmed"])
+            already_keywords = KEYWORDS.get("already", ["already confirmed"])
+
             try:
+                # build dynamic selectors from keywords
+                href_conditions = " or ".join([f"contains(@href, '{kw}')" for kw in button_keywords])
+                text_conditions = " or ".join([f"contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{kw}')" for kw in button_keywords])
+                value_conditions = " or ".join([f"contains(translate(@value, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{kw}')" for kw in button_keywords])
+
                 button_selectors = [
-                    "//a[contains(@href, 'confirm') or contains(@href, 'conferma')]",
-                    "//button[contains(text(), 'Conferma') or contains(text(), 'Confirm')]",
-                    "//a[contains(text(), 'Conferma') or contains(text(), 'Confirm')]",
-                    "//input[@type='submit' and (contains(@value, 'Conferma') or contains(@value, 'Confirm'))]",
-                    "//*[@role='button' and (contains(text(), 'Conferma') or contains(text(), 'Confirm'))]"
+                    f"//a[{href_conditions}]",
+                    f"//button[{text_conditions}]",
+                    f"//a[{text_conditions}]",
+                    f"//input[@type='submit' and ({value_conditions})]",
+                    f"//*[@role='button' and ({text_conditions})]"
                 ]
 
                 btn = None
@@ -391,22 +489,22 @@ def selenium_worker(task_data):
 
                 if btn:
                     btn.click()
-                    time.sleep(1.5)  # Reduced from 3s
+                    time.sleep(1.5)
 
                     page_content = driver.page_source.lower()
-                    if any(keyword in page_content for keyword in ["success", "confermata", "confirmed", "validata", "prenotazione confermata"]):
+                    if any(keyword in page_content for keyword in success_keywords):
                         return {'index': idx, 'success': True}
                     else:
                         return {'index': idx, 'success': False, 'error': 'No success confirmation after click'}
                 else:
                     page_content = driver.page_source.lower()
-                    if any(keyword in page_content for keyword in ["già confermata", "already confirmed", "prenotazione confermata"]):
+                    if any(keyword in page_content for keyword in already_keywords + success_keywords):
                         return {'index': idx, 'success': True}
                     return {'index': idx, 'success': False, 'error': 'Confirm button not found'}
 
             except Exception as btn_error:
                 page_content = driver.page_source.lower()
-                if any(keyword in page_content for keyword in ["già confermata", "already confirmed", "success", "confermata"]):
+                if any(keyword in page_content for keyword in already_keywords + success_keywords):
                     return {'index': idx, 'success': True}
                 return {'index': idx, 'success': False, 'error': f'Error: {str(btn_error)[:100]}'}
 
@@ -592,13 +690,15 @@ with slot_btn_col2:
 
 st.divider()
 
-# buttons side by side
-btn_col1, btn_col2 = st.columns([1, 1])
+# buttons row
+btn_col1, btn_col2, btn_col3 = st.columns([2, 2, 1])
 with btn_col1:
     total_bookings = len(dates) * len(st.session_state.time_slots)
     launch_btn = st.button(f"LAUNCH ({total_bookings} bookings)", type="primary", use_container_width=True)
 with btn_col2:
     validate_btn = st.button("VALIDATE ONLY (Last 3h)", type="secondary", use_container_width=True)
+with btn_col3:
+    delete_mail_btn = st.button("🗑️ Clean Inbox", use_container_width=True, help="Delete Affluences emails from last 7 days")
 
 if launch_btn:
     if not email_pass:
@@ -808,6 +908,23 @@ if validate_btn:
             
             if not validated_results and not failed_results:
                 st.warning("No reservations were processed.")
+
+# delete affluences emails
+if delete_mail_btn:
+    if not email_pass:
+        st.error("No password.")
+    else:
+        with st.spinner("Searching and deleting Affluences emails..."):
+            found, deleted, error = delete_affluences_emails(email_user, email_pass, days=7)
+
+        if error:
+            st.error(f"Error: {error}")
+        elif found == 0:
+            st.info("No Affluences emails found in the last 7 days")
+        elif deleted == found:
+            st.success(f"🗑️ Found {found} email(s) → Deleted {deleted} successfully!")
+        else:
+            st.warning(f"Found {found} email(s) → Deleted {deleted} (some failed)")
 
 if st.session_state.history:
     df = pd.DataFrame(st.session_state.history)[["DateStr", "TimeSlot", "Status"]]
