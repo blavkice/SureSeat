@@ -9,11 +9,14 @@ Automated reservation system targeting the Affluences booking platform. After de
 ## Capabilities
 
 - Direct API booking via reverse-engineered endpoints
-- Automated email confirmation harvesting (IMAP search with Italian date parsing)
+- Automated email confirmation harvesting (IMAP search with multilingual date parsing)
 - Concurrent validation using headless Chrome instances (ThreadPoolExecutor)
 - Hardware-tied credential encryption (machine-specific decryption keys)
 - Persistent state management with JSON storage
 - Built-in rate limiting and daemon conflict resolution
+- HTTP connection pooling for faster API requests
+- Persistent IMAP connections for efficient email polling
+- Inbox cleanup for Affluences emails
 
 ## Installation
 
@@ -92,6 +95,14 @@ If you have pending reservations that need validation:
 3. Automatically validates all found confirmations
 4. Shows success/failure report
 
+### Clean Inbox
+
+To delete Affluences emails cluttering your inbox:
+
+1. Click "🗑️ Clean Inbox"
+2. Deletes all Affluences emails from the last 7 days
+3. Removes both confirmation requests and confirmed booking emails
+
 ### Multiple Time Slots
 
 To book multiple slots per day (e.g., morning + afternoon):
@@ -123,7 +134,9 @@ If you encounter Chrome daemon conflicts:
 
 ## Notes
 
-- **Language**: Currently only works with Italian emails (date parsing looks for "gennaio", "febbraio", etc.)
+- **Language**: Supports 10 languages (English, Spanish, French, Portuguese, German, Italian, Dutch, Polish, Russian, Turkish). Configuration files:
+  - `months.csv` - month names for email date parsing
+  - `keywords.csv` - button labels and success messages for web scraping
 - **Rate Limiting**: The app includes delays between requests to avoid rate limiting
 - **Quota**: Affluences has booking quotas - respect their limits
 - **Email**: Only works with Gmail (uses IMAP)
