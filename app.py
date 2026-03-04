@@ -349,7 +349,7 @@ def get_email_links(mail_user, mail_app_password, hours=None, use_persistent=Fal
         mail_ids = messages[0].split()
 
         for email_id in mail_ids:
-            _, data = mail.fetch(email_id, '(RFC822)')
+            _, data = mail.fetch(email_id, '(BODY.PEEK[])')
             msg = email.message_from_bytes(data[0][1])
             body = _parse_email_body(msg)
             reservation = _extract_reservation_from_body(body)
@@ -435,6 +435,9 @@ def selenium_worker(task_data):
     while retry_count <= max_retries:
         try:
             chrome_options = Options()
+            chrome_binary = get_chrome_binary()
+            if chrome_binary:
+                chrome_options.binary_location = chrome_binary
             chrome_options.add_argument("--headless")
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
@@ -534,6 +537,35 @@ def get_cached_driver_path():
         return ChromeDriverManager().install()
     except Exception:
         return None
+
+@st.cache_resource(show_spinner=False)
+def get_chrome_binary():
+    """Find Chrome/Chromium binary path on the system."""
+    import shutil
+    candidates = [
+        # macOS
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        # Linux
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/snap/bin/chromium",
+        # Windows
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ]
+    # check direct paths first
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    # fallback: search PATH
+    for name in ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]:
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
 
 if "history" not in st.session_state: st.session_state.history = []
 if "time_slots" not in st.session_state: st.session_state.time_slots = [{"start": "14:00", "end": "18:00"}]
@@ -711,7 +743,10 @@ if launch_btn:
         # Use cached driver path
         cached_driver_path = get_cached_driver_path()
         if not cached_driver_path:
-            st.error("Failed to load Chrome driver")
+            st.error("Failed to load ChromeDriver")
+            st.stop()
+        if not get_chrome_binary():
+            st.error("Chrome not found. Install Google Chrome and restart the app.")
             st.stop()
 
         # Get HTTP session for connection pooling
@@ -778,15 +813,16 @@ if launch_btn:
         try:
             while (time.time() - start_time) < timeout:
                 pending_indices = [i for i, r in enumerate(st.session_state.history)
-                                   if not r["Confirmed"] and "Sent" in r["Status"]]
+                                   if not r["Confirmed"] and r["Status"] in ("Sent", "Retry...", "Validating...")]
 
                 if not pending_indices:
                     break
 
                 status_text.write(f"Checking inbox... ({int(timeout - (time.time()-start_time))}s left)")
 
-                # Use persistent IMAP connection
-                found_emails = get_email_links(email_user, email_pass, use_persistent=True)
+                # Use persistent IMAP connection - search last 30min, not UNSEEN
+                # (RFC822 fetch marks emails as read, so UNSEEN would miss them on retry)
+                found_emails = get_email_links(email_user, email_pass, hours=1, use_persistent=True)
 
                 tasks = []
                 for email_item in found_emails:
@@ -824,7 +860,7 @@ if launch_btn:
         status_text.success("Finished.")
 
         for i, r in enumerate(st.session_state.history):
-            if not r["Confirmed"] and "Sent" in r["Status"]:
+            if not r["Confirmed"] and r["Status"] in ("Sent", "Retry...", "Validating..."):
                 st.session_state.history[i]["Status"] = "Timeout"
         dashboard.dataframe(pd.DataFrame(st.session_state.history))
         st.success("Process completed")
@@ -845,7 +881,10 @@ if validate_btn:
         # Use cached driver path
         cached_driver_path = get_cached_driver_path()
         if not cached_driver_path:
-            st.error("Failed to load Chrome driver")
+            st.error("Failed to load ChromeDriver")
+            st.stop()
+        if not get_chrome_binary():
+            st.error("Chrome not found. Install Google Chrome and restart the app.")
             st.stop()
 
         with st.spinner("Searching emails from last 3 hours..."):
