@@ -4,45 +4,111 @@ Automated reservation system targeting the Affluences booking platform. After de
 
 **Technical Approach**: Intercepted and analyzed the booking POST requests to identify required parameters and authentication patterns. Implemented direct API interaction bypassing the web interface, combined with IMAP-based email scraping for confirmation token extraction.
 
-**Security Implementation**: Machine-specific credential encryption using XOR cipher with SHA256-derived keys tied to hostname+username. All sensitive data encrypted at rest, no plaintext credentials in version control.
+**Credential Storage**: The Gmail app password is not stored in plaintext. It is obfuscated with a XOR cipher keyed on a SHA-256 of `hostname + username` and saved base64-encoded under `.streamlit/.creds`. This keeps secrets out of version control and ties the file to the machine that wrote it, but it is **obfuscation**, not strong cryptography: anyone with read access to that machine can recover the password. Treat the credentials file as sensitive, and prefer a dedicated Gmail app password that you can revoke.
 
 ## Capabilities
 
 - Direct API booking via reverse-engineered endpoints
 - Automated email confirmation harvesting (IMAP search with multilingual date parsing)
 - Concurrent validation using headless Chrome instances (ThreadPoolExecutor)
-- Hardware-tied credential encryption (machine-specific decryption keys)
+- Machine-tied credential obfuscation (no plaintext password on disk)
 - Persistent state management with JSON storage
 - Built-in rate limiting and daemon conflict resolution
 - HTTP connection pooling for faster API requests
 - Persistent IMAP connections for efficient email polling
 - Inbox cleanup for Affluences emails
 
+## Project Structure
+
+The logic is split into a small package, keeping `app.py` as a thin UI layer:
+
+```
+app.py                      Streamlit UI and flow orchestration
+sureseat/
+  config.py                 Constants and environment-driven configuration
+  i18n.py                   Multilingual month / keyword tables (from CSV)
+  crypto.py                 Machine-tied credential storage
+  storage.py                Saved places persistence
+  chrome.py                 Chrome/Chromium discovery and headless options
+  booking/
+    api.py                  Affluences reservation HTTP client
+    email_client.py         IMAP confirmation harvesting and inbox cleanup
+    validator.py            Headless-Chrome confirmation of reservation links
+```
+
 ## Installation
 
 ### Prerequisites
 
 - Python 3.8+
-- Chrome browser installed
+- Chrome or Chromium browser installed
 - Gmail account with App Password
 
-### Installation
+### Local install
 
 1. Clone the repository:
+
 ```bash
 git clone https://github.com/blavkice/SureSeat.git
-cd sureseat
+cd SureSeat
 ```
 
 2. Install dependencies:
+
 ```bash
-pip install streamlit selenium webdriver-manager requests pandas
+pip install -r requirements.txt
 ```
 
 3. Run the app:
+
 ```bash
 streamlit run app.py
 ```
+
+The app is then available at http://localhost:8501.
+
+## Running with Docker
+
+Docker bundles Python, Chromium and the matching driver, so nothing needs to be
+installed on the host beyond Docker itself.
+
+### With Docker Compose (recommended)
+
+```bash
+docker compose up --build
+```
+
+Open http://localhost:8501. Saved places and encrypted credentials are written
+to a local `./data` directory (created on first run) so they survive restarts.
+
+### With plain Docker
+
+```bash
+docker build -t sureseat .
+docker run -p 8501:8501 -v "$(pwd)/data:/app/data" \
+  -e SURESEAT_PLACES_FILE=/app/data/places.json \
+  -e SURESEAT_CREDS_FILE=/app/data/.creds \
+  sureseat
+```
+
+### Configuration via environment variables
+
+
+| Variable               | Default             | Purpose                                |
+| ---------------------- | ------------------- | -------------------------------------- |
+| `CHROME_BINARY`        | autodetected        | Path to the Chrome/Chromium binary     |
+| `CHROMEDRIVER_PATH`    | webdriver-manager   | Path to a preinstalled chromedriver    |
+| `SURESEAT_PLACES_FILE` | `places.json`       | Where saved places are stored          |
+| `SURESEAT_CREDS_FILE`  | `.streamlit/.creds` | Where encrypted credentials are stored |
+| `SURESEAT_IMAP_SERVER` | `imap.gmail.com`    | IMAP server for email polling          |
+| `SURESEAT_MAX_WORKERS` | `5`                 | Parallel Selenium validation workers   |
+
+Inside Docker, `CHROME_BINARY` and `CHROMEDRIVER_PATH` are preset to the system
+Chromium, so no driver is downloaded at runtime.
+
+> Note: credentials are encrypted with a key derived from hostname + user. The
+> Compose file pins the container hostname so the encrypted file stays readable
+> across rebuilds.
 
 ## Configuration
 
@@ -77,7 +143,7 @@ Places are automatically saved to `places.json` and persist across sessions.
 
 1. **Select Place**: Choose from your saved places
 2. **Set Date**: Pick start date (defaults to tomorrow)
-3. **Choose Mode**: 
+3. **Choose Mode**:
    - "Single": Book only the selected date
    - "Repeat (Week)": Book for the next 7 days
 4. **Configure Time Slots**: Add multiple slots per day if needed
@@ -99,7 +165,7 @@ If you have pending reservations that need validation:
 
 To delete Affluences emails cluttering your inbox:
 
-1. Click "🗑️ Clean Inbox"
+1. Click "Clean Inbox"
 2. Deletes all Affluences emails from the last 7 days
 3. Removes both confirmation requests and confirmed booking emails
 
@@ -117,6 +183,7 @@ To book multiple slots per day (e.g., morning + afternoon):
 ### Chrome Issues
 
 If you encounter Chrome daemon conflicts:
+
 - The app automatically kills stale Chrome processes before starting
 - If issues persist, click "Close App" in sidebar to clean up
 

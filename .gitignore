@@ -5,6 +5,9 @@
 # User data
 places.json
 
+# Docker-mounted user data
+data/
+
 # Python
 __pycache__/
 *.py[cod]

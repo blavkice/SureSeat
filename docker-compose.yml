@@ -1,0 +1,16 @@
+services:
+  sureseat:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      # persist saved places and encrypted credentials across restarts.
+      - ./data:/app/data
+    environment:
+      # store user data inside the mounted volume.
+      - SURESEAT_PLACES_FILE=/app/data/places.json
+      - SURESEAT_CREDS_FILE=/app/data/.creds
+      # the credential key is derived from hostname + user; pin the hostname
+      # so the encrypted file stays readable across container rebuilds
+      - HOSTNAME=sureseat
+    restart: unless-stopped
